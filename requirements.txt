@@ -1,0 +1,4 @@
+# 核心确定性功能仅使用 Python 标准库（sqlite3 / unittest / argparse），无第三方硬依赖。
+# LLM 适配层（loseweight/llm.py）优先使用 requests 调用 DeepSeek（OpenAI 兼容协议）；
+# 若未安装 requests，会自动回退到标准库 urllib，仍可正常工作。
+requests>=2.28
