@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from . import calculations as calc
 from . import config
@@ -49,7 +49,7 @@ def route_intent(text: str) -> str:
     if re.search(r"补救|超标|吃多|吃超|暴食|水肿|肿了|超了", t):
         return "request_recovery"
 
-    if re.search(r"汇总|总结|剩余|还剩|今日摄入|今天吃了什么|今天吃了啥|吃了多少|看.*记录|记录.*看", t):
+    if re.search(r"汇总|总结|剩余|还剩|今日摄入|吃了什么|吃了啥|吃了多少|看.*记录|记录.*看", t):
         return "get_daily_summary"
 
     if re.search(r"吃什么|推荐|食谱|菜单|今晚|明天吃|建议.*吃|配餐|怎么吃", t):
@@ -117,6 +117,61 @@ def detect_meal_type(text: str) -> str | None:
         return "dinner"
     if "零食" in text or "加餐" in text or "夜宵" in text or "宵夜" in text:
         return "snack"
+    return None
+
+
+def extract_date(text: str) -> str | None:
+    """从文本抽取日志日期，返回 YYYY-MM-DD；识别不到返回 None。
+
+    支持：今天/今日、昨天/昨日、前天、大前天、X月X日/号、X日/号。
+    纯「X日/号」按本月处理，若落在未来则自动退到上个月。
+    """
+    today_d = datetime.now()
+    t = text
+    if "大前天" in t:
+        return (today_d - timedelta(days=3)).strftime("%Y-%m-%d")
+    if "前天" in t:
+        return (today_d - timedelta(days=2)).strftime("%Y-%m-%d")
+    if "昨天" in t or "昨日" in t:
+        return (today_d - timedelta(days=1)).strftime("%Y-%m-%d")
+    if "今天" in t or "今日" in t:
+        return today_d.strftime("%Y-%m-%d")
+
+    m = re.search(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", t)
+    if m:
+        year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            return datetime(year, month, day).strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+
+    m = re.search(r"(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]", t)
+    if m:
+        month, day = int(m.group(1)), int(m.group(2))
+        year = today_d.year
+        try:
+            d = datetime(year, month, day)
+        except ValueError:
+            return None
+        if d.date() > today_d.date():  # 未来日期视为上一年
+            year -= 1
+        try:
+            return datetime(year, month, day).strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+
+    m = re.search(r"(?<!\d)(\d{1,2})\s*[日号]", t)
+    if m:
+        day = int(m.group(1))
+        year, month = today_d.year, today_d.month
+        if day > today_d.day:  # 落在本月未来，退到上个月
+            month -= 1
+            if month == 0:
+                month, year = 12, year - 1
+        try:
+            return datetime(year, month, day).strftime("%Y-%m-%d")
+        except ValueError:
+            return None
     return None
 
 
@@ -337,7 +392,9 @@ class Agent:
             return self._edit_meal(text)
 
         if intent == "get_daily_summary":
-            return self._format_summary(services.get_daily_summary(self.conn, self.user_id))
+            return self._format_summary(
+                services.get_daily_summary(self.conn, self.user_id, log_date=extract_date(text))
+            )
 
         if intent == "request_plan":
             meal_type = detect_meal_type(text) or calc.infer_meal_type(datetime.now().hour)
@@ -370,6 +427,7 @@ class Agent:
         if not entries:
             return "没有识别到明确食物。请说食物名，例如「吃了鸡胸肉 150 克」。支持的食物可输入「食物」查看。"
 
+        log_date = extract_date(text) or repo.today()
         fallback_meal = detect_meal_type(text) or calc.infer_meal_type(datetime.now().hour)
         lines = []
         summary = None
@@ -379,6 +437,7 @@ class Agent:
             r = services.log_meal(
                 self.conn, self.user_id, meal_type=meal_type,
                 food_id=e["food_id"], grams=e["grams"], is_estimated=e["is_estimated"],
+                log_date=log_date,
             )
             est = "（估算份量）" if e["is_estimated"] else ""
             dup = "（⚠ 与已有记录完全相同，疑似重复）" if r["duplicate"] else ""
@@ -390,9 +449,10 @@ class Agent:
 
         if summary is not None:
             s = summary
-            lines.append(f"今日累计：{s['total_kcal']:.0f} kcal")
+            day_label = "今日" if s["date"] == repo.today() else f"{s['date']} 当日"
+            lines.append(f"{day_label}累计：{s['total_kcal']:.0f} kcal")
             if s["target_kcal"] is not None:
-                lines.append(f"今日目标：{s['target_kcal']:.0f} kcal，剩余额度 {s['remaining_kcal']:.0f} kcal")
+                lines.append(f"{day_label}目标：{s['target_kcal']:.0f} kcal，剩余额度 {s['remaining_kcal']:.0f} kcal")
         return "\n".join(lines)
 
     def _log_estimated_meal(self, text: str) -> str:
@@ -400,17 +460,20 @@ class Agent:
         if not m:
             return "请说明估算热量，例如「午餐轻食约 470 大卡」。"
         kcal = float(m.group(1))
+        log_date = extract_date(text) or repo.today()
         meal_type = detect_meal_type(text) or calc.infer_meal_type(datetime.now().hour)
         label = "轻食" if "轻食" in text else "估算餐"
         r = services.log_estimated_meal(
             self.conn, self.user_id, meal_type=meal_type, kcal=kcal, label=label,
+            log_date=log_date,
         )
         mt_label = config.MEAL_TYPE_LABELS[meal_type]
         lines = [f"已记录：{mt_label} · {r['entry']['name']} ≈ {r['entry']['kcal']:.0f} kcal（估算）"]
         s = r["summary"]
-        lines.append(f"今日累计：{s['total_kcal']:.0f} kcal")
+        day_label = "今日" if s["date"] == repo.today() else f"{s['date']} 当日"
+        lines.append(f"{day_label}累计：{s['total_kcal']:.0f} kcal")
         if s["target_kcal"] is not None:
-            lines.append(f"今日目标：{s['target_kcal']:.0f} kcal，剩余额度 {s['remaining_kcal']:.0f} kcal")
+            lines.append(f"{day_label}目标：{s['target_kcal']:.0f} kcal，剩余额度 {s['remaining_kcal']:.0f} kcal")
         return "\n".join(lines)
 
     def _skip_meal(self, text: str) -> str:
@@ -445,6 +508,7 @@ class Agent:
             r = services.delete_meal_entry(
                 self.conn, self.user_id, meal_type=meal_type,
                 food_id=foods[0]["food_id"] if foods else None,
+                log_date=extract_date(text),
             )
         except ValueError as e:
             return str(e)
@@ -469,6 +533,7 @@ class Agent:
                 self.conn, self.user_id, food_id=target["food_id"],
                 new_grams=new_grams,
                 new_food_id=new_food["food_id"] if new_food else None,
+                log_date=extract_date(text),
             )
         except ValueError as e:
             return str(e)
@@ -574,8 +639,9 @@ class Agent:
         meal_part = " · ".join(
             f"{config.MEAL_TYPE_LABELS[mt]} {b[mt]['kcal']:.0f}" for mt in config.MEAL_TYPES
         )
+        head = f"今日（{s['date']}）饮食汇总" if s["date"] == repo.today() else f"{s['date']} 饮食汇总"
         lines = [
-            f"今日（{s['date']}）饮食汇总",
+            head,
             meal_part,
             f"合计：{s['total_kcal']:.0f} kcal（蛋白质 {s['total_protein_g']:.0f}g / "
             f"脂肪 {s['total_fat_g']:.0f}g / 碳水 {s['total_carb_g']:.0f}g）",

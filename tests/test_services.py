@@ -1,5 +1,6 @@
 import os
 import unittest
+from datetime import datetime, timedelta
 
 from loseweight import agent, db, foods
 
@@ -26,6 +27,44 @@ class BaseTest(unittest.TestCase):
 
     def tearDown(self):
         self.conn.close()
+
+
+class TestDateLoggingAndFish(BaseTest):
+    def test_extract_date_relative_words(self):
+        today = datetime.now()
+        self.assertEqual(agent.extract_date("今天"), repo.today())
+        self.assertEqual(agent.extract_date("昨天"), (today - timedelta(days=1)).strftime("%Y-%m-%d"))
+        self.assertEqual(agent.extract_date("前天"), (today - timedelta(days=2)).strftime("%Y-%m-%d"))
+        self.assertEqual(agent.extract_date("大前天"), (today - timedelta(days=3)).strftime("%Y-%m-%d"))
+        self.assertIsNone(agent.extract_date("午餐吃了鸡胸肉"))
+
+    def test_extract_date_numeric(self):
+        today = datetime.now()
+        yesterday = today - timedelta(days=1)
+        self.assertEqual(agent.extract_date(f"{today.day}日"), repo.today())
+        self.assertEqual(agent.extract_date(f"{today.month}月{today.day}日"), repo.today())
+        self.assertEqual(agent.extract_date(f"{yesterday.day}日"), yesterday.strftime("%Y-%m-%d"))
+        self.assertEqual(agent.extract_date(f"{yesterday.month}月{yesterday.day}号"), yesterday.strftime("%Y-%m-%d"))
+        self.assertEqual(agent.extract_date("2026-10-26"), "2026-10-26")
+
+    def test_log_to_past_date_and_summary(self):
+        make_profile(self.conn)
+        ag = agent.Agent(self.conn, user_id="u1")
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        reply = ag.handle("昨天午餐吃了鳕鱼 100 克")
+        self.assertIn("已记录", reply)
+        self.assertIn("鳕鱼", reply)
+        self.assertEqual(len(repo.get_meals_for_date(self.conn, "u1", yesterday)), 1)
+        self.assertEqual(len(repo.get_meals_for_date(self.conn, "u1", repo.today())), 0)
+        summary = ag.handle("查昨天汇总")
+        self.assertIn("饮食汇总", summary)
+        self.assertIn("鳕鱼", summary)
+
+    def test_fish_recognition(self):
+        for name in ["鳕鱼", "鲈鱼", "金枪鱼", "带鱼", "草鱼", "罗非鱼", "黄花鱼", "鲫鱼", "巴沙鱼", "龙利鱼"]:
+            self.assertIsNotNone(foods.find_food_by_name(self.conn, name))
+        entries = agent.extract_meals(self.conn, "晚餐吃了鲈鱼 200 克")
+        self.assertIn("鲈鱼", [e["name"] for e in entries])
 
 
 class TestFoodDifferentiation(BaseTest):
